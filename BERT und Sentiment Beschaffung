@@ -1,0 +1,190 @@
+!pip install google-api-python-client
+from googleapiclient.discovery import build
+import pandas as pd
+import numpy as np
+import time
+import torch
+import torch.nn.functional as F
+import transformers
+from transformers import DistilBertTokenizerFast
+from transformers import DistilBertForSequenceClassification
+data = pd.read_csv(r"example_path", encoding='latin-1') #encoding latin-1 von gemini, Gemini(Google, 1.5 Flash) Prompt: "Eingegebener Prompt: ---------------------------------------------------------------------------UnicodeDecodeError Traceback (most recent call last) Cell In[2], line 1----> 1 data = pd.read_csv('/kaggle/input/sentiment140/training.1600000.processed.noemoticon.csv') File /opt/conda/lib/python3.10/site-packages/pandas/io/parsers/readers.py:1026, in read_csv(filepath_or_buffer, sep, delimiter, header, names, index_col, usecols, dtype, engine, converters, true_values, false_values, skipinitialspace, skiprows, skipfooter, nrows, na_values, keep_default_na, na_filter, verbose, skip_blank_lines, parse_dates, infer_datetime_format, keep_date_col, date_parser, date_format, dayfirst, cache_dates, iterator, chunksize, compression, thousands, decimal, lineterminator, quotechar, quoting, doublequote, escapechar, comment, encoding, encoding_errors, dialect, on_bad_lines, delim_whitespace, low_memory, memory_map, float_precision, storage_options, dtype_backend) 1013 kwds_defaults = _refine_defaults_read( 1014 dialect, 1015 delimiter, (...) 1022 dtype_backend=dtype_backend, 1023 ) 1024 kwds.update(kwds_defaults)-> 1026 return _read(filepath_or_buffer, kwds) File /opt/conda/lib/python3.10/site-packages/pandas/io/parsers/readers.py:626, in _read(filepath_or_buffer, kwds) 623 return parser 625 with parser:--> 626 return parser.read(nrows) File /opt/conda/lib/python3.10/site-packages/pandas/io/parsers/readers.py:1923, in TextFileReader.read(self, nrows) 1916 nrows = validate_integer("nrows", nrows) 1917 try: 1918 # error: "ParserBase" has no attribute "read" 1919 ( 1920 index, 1921 columns, 1922 col_dict,-> 1923 ) = self._engine.read( # type: ignore[attr-defined] 1924 nrows 1925 ) 1926 except Exception: 1927 self.close() File /opt/conda/lib/python3.10/site-packages/pandas/io/parsers/c_parser_wrapper.py:234, in CParserWrapper.read(self, nrows) 232 try: 233 if self.low_memory:--> 234 chunks = self._reader.read_low_memory(nrows) 235 # destructive to chunks 236 data = _concatenate_chunks(chunks) File parsers.pyx:838, in pandas._libs.parsers.TextReader.read_low_memory() File parsers.pyx:905, in pandas._libs.parsers.TextReader._read_rows() File parsers.pyx:874, in pandas._libs.parsers.TextReader._tokenize_rows() File parsers.pyx:891, in pandas._libs.parsers.TextReader._check_tokenize_status() File parsers.pyx:2053, in pandas._libs.parsers.raise_parser_error()UnicodeDecodeError: 'utf-8' codec can't decode bytes in position 232719-232720: invalid continuation byte"; 8.12.2024"
+
+
+df = pd.DataFrame({"Sentiment": data.iloc[:, 0].values, "Content": data.iloc[:, 5].values})
+#jetzt folgt ein teil welcher zu grossen Teilen aus meinem Lehrbuch stammt
+#-------------------------------------------------------------------------------------------------------------
+torch.backends.cudnn.deterministic = True
+RANDOM_SEED = 123
+torch.manual_seed(RANDOM_SEED)
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+NUM_EPOCHS = 3
+df = df.sample(frac=1).reset_index(drop=True) #https://www.educative.io/answers/how-to-shuffle-dataframe-rows
+global df
+for i in range(10001): #labels stimmten im datenset nicht
+    if df.iloc[i, 0] == 4:
+        df.iloc[i, 0] = 1
+
+#-------------------------------------------------------------------------------------------------------------
+train_texts = df.iloc[:2000]['Content'].values
+train_labels = df.iloc[:2000]['Sentiment'].values
+valid_texts = df.iloc[2000:2500]['Content'].values
+valid_labels = df.iloc[2000:2500]['Sentiment'].values
+test_texts = df.iloc[2500:3000]['Content'].values
+test_labels = df.iloc[2500:3000]['Sentiment'].values
+#-------------------------------------------------------------------------------------------------------------
+tokenizer = DistilBertTokenizerFast.from_pretrained('distilbert-base-uncased')
+
+train_encodings = tokenizer(list(train_texts), truncation=True, padding=True)
+valid_encodings = tokenizer(list(valid_texts), truncation=True, padding=True)
+test_encodings = tokenizer(list(test_texts), truncation=True, padding=True)
+#-------------------------------------------------------------------------------------------------------------
+class my_Dataset(torch.utils.data.Dataset):
+    def __init__(self, encodings, labels):
+        self.encodings = encodings
+        self.labels = labels
+
+    def __getitem__(self, idx):
+        item = {key: torch.tensor(val[idx]) for key, val in self.encodings.items()}
+        item['labels'] = torch.tensor(self.labels[idx])
+        return item
+
+    def __len__(self):
+        return len(self.labels)
+
+train_dataset = my_Dataset(train_encodings, train_labels)
+valid_dataset = my_Dataset(valid_encodings, valid_labels)
+test_dataset = my_Dataset(test_encodings, test_labels)
+
+train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=16, shuffle=True)
+valid_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=16, shuffle=False)
+test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=16, shuffle=False)
+#-------------------------------------------------------------------------------------------------------------
+model = DistilBertForSequenceClassification.from_pretrained(
+    'distilbert-base-uncased')
+model.to(DEVICE)
+model.train()
+optim = torch.optim.Adam(model.parameters(), lr=5e-5)
+#-------------------------------------------------------------------------------------------------------------
+def compute_accuracy(model, data_loader, device):
+    with torch.no_grad():
+        correct_pred, num_examples = 0, 0
+        for batch_idx, batch in enumerate(data_loader):
+            ### Prepare data
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['labels'].to(device)
+
+            outputs = model(input_ids, attention_mask=attention_mask)
+            logits = outputs['logits']
+            predicted_labels = torch.argmax(logits, 1)
+            num_examples += labels.size(0)
+            correct_pred += (predicted_labels == labels).sum()
+    return correct_pred.float()/num_examples * 100
+#-------------------------------------------------------------------------------------------------------------
+start_time = time.time()
+for epoch in range(NUM_EPOCHS):
+    model.train()
+    for batch_idx, batch in enumerate(train_loader):
+        ### Prepare data
+        input_ids = batch['input_ids'].to(DEVICE)
+        attention_mask = batch['attention_mask'].to(DEVICE)
+        labels = batch['labels'].to(DEVICE)
+
+        ### Forward pass
+        outputs = model(input_ids, attention_mask=attention_mask, labels=labels)
+        loss, logits = outputs['loss'], outputs['logits']
+
+        ### Backward pass
+        optim.zero_grad()
+        loss.backward()
+        optim.step()
+
+        ### Logging
+        if not batch_idx % 250:
+            print(f'Epoch: {epoch+1:04d}/{NUM_EPOCHS:04d} | Batch {batch_idx:04d}/{len(train_loader):04d} | Loss: {loss:.4f}')
+
+    model.eval()
+    with torch.set_grad_enabled(False):
+        print(f'Training accuracy: {compute_accuracy(model, train_loader, DEVICE):.2f}%')
+        print(f'\nValid accuracy: {compute_accuracy(model, valid_loader, DEVICE):.2f}%')
+        print(f'Time elapsed: {(time.time() - start_time)/60:.2f} min')
+    print(f'Total Training Time: {(time.time() - start_time)/60:.2f} min')
+    print(f'Test accuracy: {compute_accuracy(model, test_loader, DEVICE):.2f}%')
+
+#Raschka, Sebastian/ Yuxi Liu/ Vahid Mirhalili (2022): Machine Learning with PyTorch and Scikit-Learn, S. 605-612, Birmingham, Vereinigtes Königreicht: Packt Publishing Ltd.
+
+
+
+API_KEY = 'AIzaSyCRMyUydQ--KwIcTx17VPU3vIn2a_emSjk'
+#ab hier von chat gpt
+youtube = build('youtube', 'v3', developerKey=API_KEY)
+
+def get_comments(video_id):
+    comments = []
+    request = youtube.commentThreads().list(
+        part='snippet',
+        videoId=video_id,
+        maxResults=100
+    )
+    response = request.execute()
+    
+    while response:
+        for item in response['items']:
+            comment = item['snippet']['topLevelComment']['snippet']['textDisplay']
+            comments.append(comment)
+
+        if 'nextPageToken' in response:
+            response = youtube.commentThreads().list(
+                part='snippet',
+                videoId=video_id,
+                pageToken=response['nextPageToken'],
+                maxResults=100
+            ).execute()
+        else:
+            break
+#ChatGPT(OpenAI; GPT-4) Prompt: "whats the easiest way of scraping youtube comments"; 1.1.2025
+#bis hier von chat-gpt generiert
+#die Resultate waren nicht perfekt, weshalb ich sie weiter filtern musste
+    i = 0
+    while i < len(comments): 
+        if "<" in comments[i]:
+            comments.pop(i)
+            i -= 1
+        i += 1
+    return comments
+#die links zu den YouTube Videos
+links = ["MCvsdcc9ocM","z5MFdk8bjhw", "IfDUCZAQ3_c", "G5FcbFvWmv0", "uGxjvEv-Tdo", "ivVgTECkiSQ", "Byb2W8hTbik", "epMDcAG_YjQ", "D4VSG41nDOo", "xjn6Z2Z-jOk", "Y70ewxrK1q4", "_Nbwys56lPs", "rFfF1jpGrno", "bMLbnsKGRfo", "Z4ZeFJ65iXc", "6nD1_OVQWhc", "ThZfswPjO9Q", "kvN5_GXlg2Y", "oIQb0RPZmRA", "rq8RMd8YJ4w", "aPN13ULL0k4", "V6A2FGwq6cg", "NiNYOZZLOyg", "9WIW9HqwexQ", "NvE2T243Vu4", "NfIuDxt-IyI", "1mNf5djzvlI", "LiAzrco8wsk", "yK_1RGhqyC0", "xNv2EOc6ma0", "0iIPe9XrpcM", "H_D7GXUeHGo", "dBWFVAoNuZU", "y_FmEbP7T8E", "oJF2KHNZfVA", "pkc0YNkRyeQ"]
+
+
+def nlp_score(url, device):
+    comments = get_comments(url)
+    if len(comments) > 400:
+        comments = comments[:400]
+    labels = []#(Raschka 2022) ab hier
+    tokenizer = DistilBertTokenizerFast.from_pretrained('distilbert-base-uncased')
+    encodings = tokenizer(comments, truncation=True, padding=True)
+    for i in range(len(comments)):
+        labels.append(1)
+    dataset = my_Dataset(encodings, labels)
+    loader = torch.utils.data.DataLoader(dataset, batch_size=16, shuffle=False)
+    with torch.no_grad():
+        guessed_pos, num_examples = 0, 0
+        for batch_idx, batch in enumerate(loader):
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['labels'].to(device)
+
+            outputs = model(input_ids, attention_mask=attention_mask)
+            logits = outputs['logits']
+            predicted_labels = torch.argmax(logits, 1)
+            num_examples += labels.size(0)
+            guessed_pos += (predicted_labels == labels).sum() #hier habe ich die funktion umfunktioniert um positive vorhersagen zu tracken
+    print("guessed_pos: ", guessed_pos, "num_examples: ", num_examples)
+    print((guessed_pos / num_examples).item())
+    return (guessed_pos / num_examples).item()
+
+scores = []
+for link in links:
+    scores.append(nlp_score(link, DEVICE))
+#Zusammengefasst haben wir hier alle 36 Sentiment Scores Gesammelt
