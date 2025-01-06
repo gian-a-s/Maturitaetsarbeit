@@ -1,0 +1,361 @@
+import pandas as pd
+import pytorch_lightning as pl
+import torch
+import torch.autograd as autograd
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import yfinance as yf
+import math
+from sklearn.metrics import accuracy_score as accuracy
+import random
+
+symbol = "AAPL"
+ticker = yf.Ticker(symbol)
+df = pd.DataFrame()
+df = pd.DataFrame({'dev_ratio': [1], "MA": [1], 'RSI': [1], "VWAP": [1]})
+#die drei Indikatoren wurden mithilfe von ki generiert
+def calculate_ma(data, row, window=14):
+    ma = data['Close'].rolling(window=window, min_periods=1).mean()
+    ma = ma.iloc[-1] 
+    return ma / row['Close']
+def calculate_rsi(data, window=14):
+    delta = data['Close'].diff()
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
+
+    avg_gain = gain.rolling(window=window, min_periods=1).mean()
+    avg_loss = loss.rolling(window=window, min_periods=1).mean()
+
+    # Add a small epsilon to avoid division by zero
+    epsilon = 1e-10
+    rs = avg_gain / (avg_loss + epsilon)
+    rs = rs.iloc[-1]
+    rsi = 100 - (100 / (1 + rs))
+    return math.log(rsi)
+def calculate_vwap(data, row): #formel von ki
+    q = data['Volume']
+    p = data['Close']
+    vwap = (p * q).cumsum() / q.cumsum()
+    vwap = vwap.iloc[-1]
+    return vwap / row['Close']
+#Co-Pilot (Microsoft, GPT-4): "Calculate the moving average, rsi and vwap from a pandas dataframe"; Herbst 2024
+def dev_ratio(row,  new_row):
+    dif = new_row["Close"] / row["Close"]
+    if dif > 1:
+        return 1
+    else:
+        return 0
+def append_new_row(data, row, new_row, df):
+    new_row = pd.DataFrame({"dev_ratio": [dev_ratio(row, new_row)], 'MA': [calculate_ma(data, row)], 'RSI': [calculate_rsi(data)], "VWAP": [calculate_vwap(data, row)]})
+    df = pd.concat([df, new_row], ignore_index=True)
+    return df
+    
+data = ticker.history(period='10y',
+                      interval='1d',
+                      start=None,
+                      end=None,
+                      actions=True,
+                      auto_adjust=True,
+                      back_adjust=False)
+
+column_names = data.columns
+rows_list = [data.iloc[i] for i in range(len(data))]
+for i in range(len(rows_list) - 15):
+    data = pd.DataFrame(rows_list[i:i+14])
+    row = rows_list[i + 13]
+    new_row = rows_list[i + 14]
+    df = append_new_row(data, row, new_row, df)
+df = df.drop(index=0)
+df = df.dropna()
+print(df)
+rows = [dict(ma=row.MA, rsi=row.RSI, vwap=row.VWAP, dev=row.dev_ratio) for _, row in df.iterrows()]
+features_df = pd.DataFrame(rows)
+features_df['dev'] = features_df['dev'].shift(1) #mir ist durchaus bewusst, dass das Erstellen eines neuen df unnötig ist, jedoch kontrolliere ich gerne, was zwischen den Schritten passiert
+features_df = features_df.dropna()
+print(features_df)
+train_size = int(len(features_df) * 0.9)
+def create_sequences(input_data: pd.DataFrame, target_column, sequence_length):
+    sequences = []
+    data_size = len(input_data)
+    for i in range(data_size - sequence_length):
+        sequence = input_data[i:i+sequence_length]
+        label_position = i  + sequence_length
+        label = input_data.iloc[label_position][target_column]
+        sequences.append((sequence, label))
+    return sequences
+
+SEQUENCE_LENGTH = 30
+sequences = create_sequences(features_df, "dev", SEQUENCE_LENGTH)
+train_sequences, test_sequences = sequences[:train_size], sequences[train_size:]
+def counter(seq):
+    counter = 0
+    for i in range(len(seq)):
+        if seq[i][1] == 1:
+            counter += 1
+    return 2 * counter - len(seq)
+def correct(seq):
+    i = 0
+    n = (len(seq)) - 1
+    x = counter(seq)
+    while i < x:
+        r = random.randint(0, n)
+        if seq[r][1] == 1:
+            m = seq.pop(r)
+            i += 1
+            n -= 1 
+    return seq
+test_sequences = correct(test_sequences)
+train_sequences = correct(train_sequences)
+class APPLDataset(Dataset):
+    def __init__(self, sequences):
+        self.sequences = sequences
+    def __len__(self):
+        return len(self.sequences)
+    def __getitem__(self, idx):
+        sequence, label = self.sequences[idx]
+        return dict(sequence=torch.Tensor(sequence.to_numpy()), label=torch.tensor(label).long())
+class APPLPriceDataModule(pl.LightningDataModule):
+    def __init__(self, train_sequences, test_sequences, batch_size):
+        super().__init__()
+        self.train_sequences = train_sequences
+        self.test_sequences = test_sequences
+        self.batch_size = batch_size
+    def setup(self, stage=None):
+        self.train_dataset = APPLDataset(self.train_sequences)
+        self.test_dataset = APPLDataset(self.test_sequences)
+    def train_dataloader(self):
+        return DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=False)
+    def test_dataloader(self):
+        return DataLoader(self.test_dataset, batch_size=1, shuffle=False)
+N_EPOCHS = 200
+BATCH_SIZE = 64
+n_features=4
+data_module = APPLPriceDataModule(train_sequences, test_sequences, BATCH_SIZE)
+data_module.setup()
+class PricePredictionModel(nn.Module):
+    def __init__(self, features, n_classes, n_hidden=256, n_layers=3):
+        super().__init__()
+        #self.n_hidden = n_hidden
+        self.lstm = nn.LSTM(input_size=n_features, hidden_size=n_hidden, batch_first=True, num_layers=n_layers, dropout=0.75)
+        self.classifier = nn.Linear(n_hidden, n_classes)
+    def forward(self, x):
+        self.lstm.flatten_parameters()
+        _, (hidden, _) = self.lstm(x)
+        out = hidden[-1]
+        return self.classifier(out)
+
+class APPLPricePredictor(pl.LightningModule):
+    def __init__(self, n_features=4, n_classes=2): #n_features: int irgendwas stimmt hier nicht
+        super().__init__()
+        self.model = PricePredictionModel(n_features, n_classes)
+        self.criterion = nn.CrossEntropyLoss()
+    def forward(self, x, labels=None):
+        output = self.model(x)
+        loss = 0
+        if labels is not None:
+            loss = self.criterion(output, labels) #.unsqueeze(dim=1)
+        return loss, output
+    def training_step(self, batch ,batch_idx):
+        sequences = batch["sequence"]
+        labels = batch["label"]
+        loss, outputs = self(sequences, labels)
+        predictions = torch.argmax(outputs, dim=1)
+        step_accuracy = accuracy(predictions, labels)
+        return {"loss": loss, "accuracy": step_accuracy}
+    def test_step(self, batch ,batch_idx):
+        print("happens")
+        sequences = batch["sequence"]
+        labels = batch["label"]
+        loss, outputs = self(sequences, labels)
+        predictions = torch.argmax(outputs, dim=1)
+        step_accuracy = accuracy(predictions, labels)
+        return {"loss": loss, "accuracy": step_accuracy}
+    def configure_optimizers(self):
+        return optim.AdamW(self.parameters(), lr=0.0001)
+model = APPLPricePredictor(n_features=n_features, n_classes=2)
+trainer = pl.Trainer(max_epochs=N_EPOCHS)
+trainer.fit(model, data_module)
+model.eval()
+test_dataset = APPLDataset(test_sequences)
+predictions = []
+labels=[]
+outputs = []
+for item in test_dataset:
+    sequence = item["sequence"]
+    label = item["label"]
+    _, output = model(sequence.unsqueeze(dim=0))
+    outputs.append(output)
+    prediction = torch.argmax(output, dim=1)
+    predictions.append(prediction.item())
+    labels.append(label.item())
+correct = 0
+for i in range(len(predictions)):
+    if labels[i] == predictions[i]:
+        correct += 1
+
+f = correct / len(predictions) * 100
+print(f)
+print(labels)
+print(predictions)
+
+#jetzt wird die genauigkeit bei realen verteilungen auf verschiedenen Aktien getestet
+def return_accuracy(stock):
+    symbol = stock
+    ticker = yf.Ticker(symbol)
+    df = pd.DataFrame()
+    df = pd.DataFrame({'dev_ratio': [1], "MA": [1], 'RSI': [1], "VWAP": [1]})
+    data = ticker.history(period='1y',
+                      interval='1d',
+                      start=None,
+                      end=None,
+                      actions=True,
+                      auto_adjust=True,
+                      back_adjust=False)
+
+    column_names = data.columns
+    rows_list = [data.iloc[i] for i in range(len(data))]
+    for i in range(len(rows_list) - 15):
+        data = pd.DataFrame(rows_list[i:i+14])
+        row = rows_list[i + 13]
+        new_row = rows_list[i + 14]
+        df = append_new_row(data, row, new_row, df)
+    df = df.drop(index=0)
+    df = df.dropna()
+    
+    rows = [dict(ma=row.MA, rsi=row.RSI, vwap=row.VWAP, dev=row.dev_ratio) for _, row in df.iterrows()] #dev=row.dev_ratio
+    features_df = pd.DataFrame(rows)
+    features_df['dev'] = features_df['dev'].shift(1)
+    features_df = features_df.dropna()
+    sequences = create_sequences(features_df, "dev", SEQUENCE_LENGTH)
+    test_dataset = APPLDataset(sequences)
+    predictions = []
+    labels=[]
+    model.eval()
+    for item in test_dataset:
+        sequence = item["sequence"]
+        label = item["label"]
+        _, output = model(sequence.unsqueeze(dim=0))
+        prediction = torch.argmax(output, dim=1)
+        predictions.append(prediction.item())
+        labels.append(label.item())
+    correct = 0
+    for i in range(len(predictions)):
+        if labels[i] == 0 and predictions[i] == 0:
+            correct += 1
+        elif labels[i] == 1 and predictions[i] == 1:
+            correct += 1
+    f = correct / len(predictions) * 100 
+
+        
+    
+
+    positive = 0
+    for i in range(len(labels)):
+        if labels[i] == 1:
+            positive += 1
+    return f, (positive / len(labels)) * 100
+
+stocks = ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA", "META", "WMT", "NVDA"]
+ac_list = []
+pos = []
+for stock in stocks:
+    ac, p = return_accuracy(stock)
+    ac_list.append(ac)
+    pos.append(p)
+print(ac_list)
+print(pos)
+#um wahrscheinlichkeiten für klassen für das nächste Modell zu berechnen
+scores = [0.42500001192092896, 0.5, 0.5012787580490112, 0.46000000834465027, 0.37962964177131653, 0.4861878454685211, 0.5074999928474426, 0.42500001192092896, 0.3221476376056671, 0.39298245310783386, 0.3507108986377716, 0.4074999988079071, 0.5345911979675293, 0.48249998688697815, 0.4226190447807312, 0.41999998688697815, 0.5899999737739563, 0.5924999713897705, 0.4601770043373108, 0.55409836769104, 0.4356435537338257, 0.48500001430511475, 0.3449999988079071, 0.32499998807907104, 0.38118812441825867, 0.4113207459449768, 0.3333333432674408, 0.3774999976158142, 0.36666667461395264, 0.4124999940395355, 0.4350000023841858, 0.3799999952316284, 0.3725000023841858, 0.3502824902534485, 0.35329341888427734, 0.42750000953674316] #für frau holler eingefügt damit nachvollziehbar
+wichtige_daten = ['2022-01-21', '2022-02-07', '2022-03-26', '2022-04-13', '2022-05-10', '2022-06-03', '2022-07-26', '2022-08-23', '2022-09-13', '2022-10-01', '2022-11-06', '2022-12-05', '2023-01-07', '2023-02-03', '2023-03-21', '2023-04-06', '2023-05-27', '2023-06-15', '2023-07-11', '2023-08-14', '2023-09-18', '2023-10-29', '2023-11-06', '2023-12-12', '2024-01-26', '2024-02-29', '2024-03-12', '2024-04-12', '2024-05-24', '2024-06-01', '2024-07-17', '2024-08-30', '2024-09-16', '2024-10-10', '2024-11-29', '2024-12-31']
+def datums_zuordner(datum):
+    if wichtige_daten != []:
+        if wichtige_daten[0][:4] < datum[:4] or wichtige_daten[0][5:7] == datum[5:7] and wichtige_daten[0][8:] <= datum[8:]:
+            return True
+
+        else:
+            return False
+    else:
+        return False
+symbol = "AAPL"
+ticker = yf.Ticker(symbol)
+df = pd.DataFrame()
+df = pd.DataFrame({'dev_ratio': [1], "MA": [1], 'RSI': [1], "VWAP": [1]})
+
+def dev_ratio(row,  new_row):
+    if datums_zuordner(str(row)[-41:-31]) == True:
+        print(str(row)[-41:-31])
+        print(wichtige_daten.pop(0))
+        return 2
+    dif = new_row["Close"] / row["Close"]
+    if dif > 1:
+        return 1
+    else:
+        return 0
+
+data = ticker.history(period='3y',
+                      interval='1d',
+                      start=None,
+                      end=None,
+                      actions=True,
+                      auto_adjust=True,
+                      back_adjust=False)
+rows_list = [data.iloc[i] for i in range(len(data))]
+for i in range(len(rows_list) - 15):
+    data = pd.DataFrame(rows_list[i:i+14])
+    row = rows_list[i + 13]
+    new_row = rows_list[i + 14]
+    df = append_new_row(data, row, new_row, df)
+df = df.drop(index=0)
+df = df.dropna()
+rows = [dict(ma=row.MA, rsi=row.RSI, vwap=row.VWAP, dev=row.dev_ratio) for _, row in df.iterrows()] #dev=row.dev_ratio
+features_df = pd.DataFrame(rows)
+features_df['dev'] = features_df['dev'].shift(1)
+features_df = features_df.dropna()
+#warum der shift kein problem ist: der shift rückwärts ist nichts anderes als der ausgleich für den zukünftigen shift
+
+
+
+def create_sequences(input_data: pd.DataFrame, target_column, sequence_length):
+    sequences = []
+    data_size = len(input_data)
+    for i in range(data_size - sequence_length):
+        sequence = input_data[i:i+sequence_length]
+        label_position = i  + sequence_length
+        label = input_data.iloc[label_position][target_column]
+        sequences.append((sequence, label))
+    return sequences
+
+SEQUENCE_LENGTH = 30
+new_test_sequences = create_sequences(features_df, "dev", SEQUENCE_LENGTH)
+new_test_dataset = APPLDataset(new_test_sequences)
+
+new_list = []
+count = 0
+for item in new_test_dataset:
+    label = item["label"]
+    if label == 2:
+        new_list.append(count)
+        count = 0
+    count += 1
+new_list.append(count)
+print(new_list)
+new_var = []
+j = 0
+for score in scores[2:]:
+    for i in range(new_list[j]):
+            new_var.append(score)
+    j += 1
+    
+
+#Anmerkung: Hier war nichts mehr nötig um die gewünschte länge zu erreichen
+print("new_var: ")
+print(new_var)
+
+symbol = "AAPL"
+ticker = yf.Ticker(symbol)
+df = pd.DataFrame()
+df = pd.DataFrame({'dev_ratio': [1], "MA": [1], 'RSI': [1], "VWAP": [1]})
+
+
